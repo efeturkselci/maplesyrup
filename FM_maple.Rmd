@@ -1,0 +1,970 @@
+---
+title: "Forecasting Demand for Canadian Maple Syrup"
+author: "Efe Turkseleci, Anna Tronsberg, Luke Gorman, Mark O'Shea, Sam Treacy"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '2'
+  html_document:
+    toc: yes
+    number_sections: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+    toc_depth: '2'
+    df_print: paged
+    theme:
+      version: 5
+      bootswatch: lumen
+    highlight: kate
+    fig_width: 7
+    fig_height: 2.5
+    fig_caption: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,  message=FALSE, warnings=FALSE)
+```
+
+```{r echo=FALSE, message=FALSE}
+#Import libraries
+library(tidyverse)
+library(fpp3)
+library(lubridate)
+library(reshape2)
+library(ggplot2)
+library(dplyr)
+library(zoo)
+library(quantmod)
+library(stringr)
+library(tsintermittent)
+library(forecast)
+library(viridis)
+```
+
+# Introduction
+
+## Motivation & goals
+Our project focuses on conducting a time series analysis of Canadian maple syrup and products. We find this topic particularly compelling because Canada is the largest producer of maple syrup in the world, accounting for approximately 75% of global production (Government of Canada, 2021). By forecasting and analyzing demand for Canadian maple products, we aim to gain insight into the global demand for this product. According to the Government of Canada (2021), the demand for Canadian maple syrup has been on the rise worldwide, and we would like to further understand the patterns within this global demand.
+
+## About the dataset 
+We downloaded our data set from Statistics Canada, from the Canadian International Merchandise Trade by Industry for All Countries. Specifically,  we downloaded data for the ten "top maple products export destinations — by value " (Government of Canada, 2021). The data is in Canadian Dollars and is not adjusted for inflation. Our data set contains monthly data from January 2002 - Feb 2023.
+
+Although we are specifically interested in maple syrup demand, there is not a field specifically for maple syrup, but rather for "maple products". Other maple products include maple butter, maple taffy and maple sugar. However, maple syrup encompasses the large majority of this category, so we are able to use this category to accurately conduct time series analysis on maple syrup. 
+
+Our data set has a variety of problems, which we will fix in the following sections. The main problem within the data is that it contains zeroes for many of the time series, especially in the beginning of many of the series. This shows that there was intermittent demand for maple syrup, especially in the earlier years of the data, where perhaps Canadian maple syrup was not as popular as it is today. 
+
+## Methodology and strategies 
+
+### Libraries 
+We used a variety of libraries to successfully complete this report, which we have described in this section.
+
+**tidyverse** – This is a collection of packages including dplyr and ggplot2, that provide a consistent and efficient framework for data manipulation and visualization. Thisa is the package we used in coursework, and thus was necessary for this project.
+
+**fpp3** – Forecasting principles and practice 3rd edition. The package has many functions, alongside data sets. We used many of the included functions for our project,  including exponential smoothing, ARIMA and tools for model evaluation and selection.
+
+**lubridate** – This library is designed for data and time data manipulation. It helped us to format our data and time columns correctly. Simplifies tasks such as parsing, manipulating and formatting dates.
+
+**reshape2** – Used for transforming and restructuring data, can change data from wide to long format and vice versa. We used to deal with our multivariate time series data, and to prepare data for specific forecasting methods.
+
+**ggplot2** – A data visualization library that allows for the creation of visually appealing and customization plots, which are beneficial for exploring time series and identifying patterns.
+
+**zoo** – Specifically designed for handling irregular spaced time series data. Included functions such interpolation, merging and manipulating time series objects. While not directly focused on forecasting, it can be helpful in dealing with time series data that has missing or unevenly spaced observations. We used this package for linear interpolation.
+
+**quantmod** – package that is used for quantitative financial modelling and trading data. We used this package to import CPI data to use in our inflation adjustment transformation. 
+
+**forecast** – has many functions and models for time series forecasting. It included methods such as exponential smoothing, ARIMA and many more. Provides tools for model selection, evaluation and generating forecast. It is widely used for forecasting tasks in various domains.
+
+**dplyr** – a package that provides a set of functions for data manipulation and transformation. 
+
+**tsintermittent** - A tool for analyzing and forecasting intermittent time series data, we used the Croston-SBA method from this package.
+
+**stringr** - A library for working with string data. We used this for pattern matching when formatting our date columns.
+
+### Importing the data {.unnumbered}
+The steps we took to import the data are as follows:
+
+1. Load the data, change from wide to long format using the `melt` function from reshape2, and convert into a tibble
+2. The dates were then in factor format, and had to be converted to date. In this process "sept" had to be changed to "sep" and the days had to be changed from the first of the month to the end of the month.
+3. Converting to a tsibble. Some NA rows had to be removed from when the data was converted from wide to long format.
+
+```{r message= FALSE, echo=FALSE}
+#Load data and convert into a tibble. Use melt function to convert from wide to long
+dat <- read_csv("/Users/samanthatreacy/R/PROJECT_maple/maplesyrup.csv") %>% 
+  melt(id.vars = "Trading Partners",
+              variable.name="Date",
+              value.name = "maple_imports") %>% 
+  as_tibble()
+
+#Change Sept to Sep, otherwise it won't convert to date properly 
+dat$Date <- factor(str_replace_all(as.character(dat$Date),"Sept", "Sep"))
+
+#Dates are now in fctr format, change into date form
+dat <- dat %>% 
+  mutate(
+    Date = as.Date(paste0("01-", Date), format = "%d-%b-%y"),
+  )
+
+#Change dates from the first of the month to the end, since our data is exports total from the month
+dat$Month <- ceiling_date(dat$Date, "month") - days(1)
+
+#Turn into tsibble, had to remove NA for some reason even though they didn't exist before converting? Removed 200 rows, probably from when i changed the data from wide to long
+
+maple <- dat %>% select(-Date) %>% 
+  mutate(Date = yearmonth(Month)) %>% 
+  select(-Month) %>% 
+  filter(!is.na(Date)) %>% 
+  as_tsibble(
+  index = Date,
+  key = "Trading Partners")
+```
+
+```{r echo = FALSE}
+#Make a subset of the data
+maple_subset <- maple %>% 
+  filter(`Trading Partners` == (c("France","Germany", "United States", "Japan")))
+```
+
+
+### Linear Interpolation {.unnumbered}
+The majority of the methods that we are required to use for this project require data that does not contain many zeroes, so our main challenge in the beginning was to remove the zeroes from our data to use the required models. The first step we did to do this was linear interpolation. 
+
+Again, to restate an important assumption, for the majority of this project we are treating the zeroes in our dataset as missing values rather than intermittent demand.
+
+To estimate values for the series in place of the zeroes we used linear interpolation which "estimates the value of a function between any two known values" (Cuemath). To do this we first had to convert to a data frame, so that we could use the necessary packages (zoo). We replaced all 0 values with NA, and then used `na.approx` form to replace the NA values with interpolated values for the data set.
+
+In the below table, you can see a subset of the data of maple exports to Germany, between July 2009 and April 2010 before(maple_imports) and after(est_imports) linear interpolation. Unfortunately, after this issue, we still have leading zeroes in the data, which linear interpolation does not deal with. We will note our methodology towards this in further sections.
+
+```{r echo = FALSE}
+#Convert to a dataframe
+maple_df <- as.data.frame(maple)
+
+#Replace 0 values with NA
+maple_df["maple_imports"][maple_df["maple_imports"]== 0] <- NA
+
+#Interpolated the values
+maple_df_inter <- maple_df %>% 
+  mutate(est_imports = na.approx(maple_imports, na.rm =FALSE))
+
+#Replace remaining NAs back to the leading zeroes and convert back to a tsibble
+maple_df_inter[is.na(maple_df_inter)] <- 0
+maple <- maple_df_inter %>% 
+  as_tsibble(
+  index = Date,
+  key = "Trading Partners")
+
+```
+
+
+### Choosing countries for analysis and forecasting
+For most of our analysis (excluding section 7), to meet project requirements, we chose to treat these zeroes not as intermittent demand, but rather as missing values, and fill them using linear interpolation.This is an important assumption of our project.
+
+For the purposes of our report, instead of focusing on all ten countries that we downloaded data for, we have instead chosen to focus on France, Germany, Japan and the USA for analysis, and Japan and the USA for forecasting. We chose the United States because it is the top destination for Canadian maple syrup, and France and Germany because they are also consistently within the top five destinations. An additional reason we chose Japan, is because it gives us a window into the Asian market, which is a growing destination for Canadian exports. (Government of Canada, 2021)
+
+We chose to forecast for the US and Japan because of the regularity of their time series, in comparison to the others, and the importance of both of them as trading partners. The US is Canada's top trading partner and we chose Japan for the reasons mentioned above.
+
+### Mean Absolute Percentage Error Model Selection
+The mean absolute percentage error was used as our main metric to test model accuracy. It's is a common metric to use when assessing the prediction accuracy of time series forecasts. Here we have the sum of all the actual values ($A_t$) minus the forecasted values ($F_t$) divided by the actual values ($A_t$). 
+
+For this we need a test set and a set of forecasted values of equal length. Training and test sets throughout the project were created with an 85% - 15% split. The MAPE values, along with other error metrics are given in R by the `accuracy` function as well as the MAPE function with fabletools package.
+
+# Time series decomposition
+It was necessary to perform time series decomposition on our data, and adjust/transform it in various ways. Below you can see the pre-adjusted and pre-transformed data. As can be inferred, the shape of the data is not ideal.
+
+```{r}
+ggplot(maple_subset, aes(x = Date, y = maple_imports, group = `Trading Partners`, color = `Trading Partners`)) +
+  geom_line()+
+  facet_wrap(~ `Trading Partners`, nrow = 2, scales = "free_y")+   scale_color_hue() + ggtitle("Maple imports pre-adjustment & transformation")
+```
+
+## Adjustments
+
+### Inflation {.unnumbered}
+Our data set contains monetary values, in units of Canadian dollars. According to Statistics Canada, our data is not adjusted for inflation, so we adjusted the data for inflation by downloading monthly CPI data from the Federal Reserve Bank of St. Louis, filtered it based on the months in our dataset, converted it to a tsibble and then added a new column using the CPI to adjust for inflation.
+
+```{r echo = FALSE, message=FALSE, output=FALSE}
+# Get CPI data to adjust for inflation
+invisible(getSymbols("CPALCY01CAM661N",src="FRED"))
+
+#Put in data frame
+cpi <- as.data.frame(CPALCY01CAM661N) 
+cpi$Date <- as.Date(rownames(cpi))
+
+#filter the same dates as our dataset and convert to tsibble
+cpi <- cpi %>% 
+  filter(Date >= as.Date("2002-01-01")) %>% 
+  mutate(Date = yearmonth(Date)) %>% 
+  rename(cpi_value = CPALCY01CAM661N) %>% 
+  as_tsibble(index = Date)
+
+#Add CPI column and create a new column that is adjusted by inflation. Some sort of package conflict is always reconverting the date to not a tsibble anymore, so convert back
+maple <- maple %>% 
+  left_join(cpi, by ="Date") %>% 
+  mutate(adj_imports = (est_imports/cpi_value)*100) %>% 
+  as_tsibble(index = Date,
+             key = "Trading Partners")
+
+```
+
+## Transformations
+We performed power transformations on our data, including `box-cox` and `log1p`, to reduce the value of extremes in the data and make variance more constant over time. We mainly use the `box-cox` transformed data throughout this report, however in section 7 we also use the `log1p` transformed data.  
+
+```{r message = FALSE, echo = FALSE}
+#Calculate lambda for each series
+lambda_g <- maple %>% 
+  features(adj_imports, features = guerrero)
+
+#join lambdas
+maple <-  maple %>% 
+  left_join(lambda_g)
+
+#Add a small constant to deal with zeros, then perform box-cox
+maple <- maple %>% 
+  mutate(adj_imports1 = adj_imports +1000) %>% 
+  mutate(bc_adj = box_cox(adj_imports1, lambda = lambda_guerrero)) %>% 
+  as_tsibble(
+  index = Date,
+          key = "Trading Partners")
+
+#Subset again
+maple_subset <- maple %>% 
+  filter(`Trading Partners` == (c("France","Germany", "United States", "Japan")))
+```
+
+```{r echo = FALSE, out.width="50%"}
+maple <- maple %>%
+  mutate(log1p_adj = log1p(adj_imports)) %>% 
+  as_tsibble(
+  index = Date,
+          key = "Trading Partners")
+
+#Subset again
+maple_subset <- maple %>% 
+  filter(`Trading Partners` == (c("France","Germany", "United States", "Japan")))
+
+#plot to see what it looked like
+bc_adj_plot<- ggplot(maple_subset, aes(x = Date, y = bc_adj, group = `Trading Partners`, color = `Trading Partners`)) +
+  geom_line()+
+  facet_wrap(~ `Trading Partners`, nrow = 4, scales = "free_y")+   scale_color_hue() +ggtitle("Box-Cox Transformed Data")
+
+bc_adj_plot
+
+log1p_plt <- ggplot(maple_subset, aes(x = Date, y = log1p_adj, group = `Trading Partners`, color = `Trading Partners`)) +
+  geom_line()+
+  facet_wrap(~ `Trading Partners`, nrow = 4, scales = "free_y")+   scale_color_hue() + ggtitle("Log1P Transformed Data")
+
+log1p_plt
+```
+
+### Box-Cox {.unnumbered}
+To perform the box-cox transformation, we first needed to calculate the lambda value for each series in the dataset, which will determine the type and strength of the transformation applied to the data. We calculated lambda for each series using the `features` function, and then added a small constant throughout the data, to remove zeros before performing the transformation. Below you can see the appearance of the box-cox transformed data. 
+
+### log1p {.unnumbered}
+Log1p is also a form of power transformation, that deals well with data with zeroes. We performed this transformation to preserve the zeroes in our data to use in section 7: Other Forecasting Methods. Below you can see the post-log1p transformed data.
+
+```{r, echo=FALSE}
+#Make tibble for each country we are anlayzing
+france_series <- maple %>% 
+  filter(`Trading Partners` == "France")
+germany_series <- maple %>% 
+  filter(`Trading Partners` == "Germany")
+JPN_series <-  maple %>% 
+  filter(`Trading Partners` == "Japan")
+US_series<- maple %>% 
+  filter(`Trading Partners` == "United States")
+```
+
+# Time series graphics
+When we compare the countries, it becomes apparent that their imports of maple syrup vary greatly. However, we observe an increasing trend in the maple exports of all four countries. To explore this further, we will analyze the data for time series patterns, such as trend, seasonality, and cycles. 
+
+Trend is a long-term increase or decrease in data that may change direction. Seasonality is a pattern that repeats itself at a fixed and known period, such as the time of year or day of the week. A cycle occurs when there are fluctuations in data that are not of a fixed frequency and are often related to the business cycle, with a duration of at least 2 years.
+
+## Seasonality
+The following graphs illustrate how maple exports for each year developed over the months. They are useful for detecting patterns that repeat each year, such as seasonal fluctuations, and any unusual observations that may indicate abnormal behavior. Upon evaluation, no seasonality was observed in any of the graphs.
+
+```{r, fig.show="hold", out.width="50%", echo=FALSE}
+france_series %>% 
+  gg_season(bc_adj) +
+  ylab("bc_adj") +
+  ggtitle("Seasonality France")
+
+germany_series %>% 
+  gg_season(bc_adj) +
+  ylab("bc_adj") +
+  ggtitle("Seasonality Germany")
+```
+
+```{r, fig.show="hold", out.width="50%", echo=FALSE}
+JPN_series %>% 
+  gg_season(bc_adj) +
+  ylab("bc_adj") +
+  ggtitle("Seasonality Japan")
+
+US_series %>% 
+  gg_season(bc_adj) +
+  ylab("bc_adj") +
+  ggtitle("Seasonality US")
+```
+
+## Seasonal subseries plots
+The following sub series depict the changes in exports for each month. If seasonality is present, then the points will tend to group around a horizontal line for each season. On the contrary, if there is no seasonality, then the points will be scattered randomly as observed for all four countries.
+
+Clearly, in our data there is no seasonality.
+
+```{r, fig.show="hold", out.width="50%", echo=FALSE}
+france_series %>%
+  gg_subseries(bc_adj) + ylab("bc_adj") +
+  ggtitle("Subseries France")
+
+germany_series %>%
+  gg_subseries(bc_adj) + ylab("bc_adj") +
+  ggtitle("Subseries Germany")
+```
+
+```{r, fig.show="hold", out.width="50%", echo=FALSE}
+JPN_series %>%
+  gg_subseries(bc_adj) + ylab("bc_adj") +
+  ggtitle("Subseries Japan")
+
+US_series %>%
+  gg_subseries(bc_adj) + ylab("bc_adj") +
+  ggtitle("Subseries US")
+```
+
+## Autocorrelation plots
+The autocorrelation function (ACF) is a useful tool to detect autocorrelation in time series data, which indicates a relationship between values at different points in time. By analyzing the ACF pattern, we can gain insights into the underlying structure of the time series, including seasonal or cyclical components, or determine if the data is white noise.
+
+After examining the ACF plots, we can see that there is generally a high and positive autocorrelation, but with a prominent decrease as the lags increase, which is consistent with the previously identified trend. We can also visually confirm that there is no seasonal pattern. As most of the lags exhibit a significant autocorrelation, we can conclude that the studied time series does not contain white noise.
+
+```{r, fig.show="hold", out.width="50%", echo=FALSE}
+france_series %>% ACF(bc_adj, lag_max = 50) %>% autoplot()+
+  ggtitle("Autocorrelation France")
+germany_series %>% ACF(bc_adj, lag_max = 50) %>% autoplot()+
+  ggtitle("Autocorrelation Germany")
+```
+```{r, fig.show="hold", out.width="50%", echo=FALSE}
+JPN_series %>% ACF(bc_adj, lag_max = 50) %>% autoplot()+
+  ggtitle("Autocorrelation Japan")
+US_series %>% ACF(bc_adj, lag_max = 50) %>% autoplot()+
+  ggtitle("Autocorrelation United States")
+```
+
+## STL decomposition 
+Having made all of the appropriate adjustments and transformations we will do some time series decomposition to better understand the trend and seasonal components of the data. 
+
+The STL decomposition is a method used to analyze time series data by decomposing it into three components: trend, seasonal, and remainder. The trend component represents the long-term pattern or direction of the data. The seasonal component represents patterns that repeat at fixed intervals, such as weekly, monthly, or yearly. The remainder component represents the random or irregular fluctuations that are not accounted for by the trend or seasonal components.
+
+After analyzing the different components, it was observed that although there is some instability, there seems to be a growing upward trend in the data. Additionally, there is no indication of seasonality in the data. The random fluctuations in the data do not appear to follow a strong pattern, which makes it difficult to develop a forecasting model.
+
+```{r, echo=FALSE}
+#Make variable for decomposed subseries 
+dcmp_fr <- france_series %>%
+  model(stl = STL(bc_adj))
+
+dcmp_ge <- germany_series %>%
+  model(stl = STL(bc_adj))
+
+dcmp_jp <- JPN_series%>%
+  model(stl = STL(bc_adj))
+
+dcmp_us <- US_series %>%
+  model(stl = STL(bc_adj))
+
+
+```
+
+```{r, fig.show="hold", out.width="50%", echo=FALSE}
+components(dcmp_fr) %>% autoplot() + xlab("France")
+components(dcmp_ge) %>% autoplot() + xlab("Germany")
+```
+```{r, fig.show="hold", out.width="50%", echo=FALSE}
+components(dcmp_jp) %>% autoplot() + xlab("Japan")
+components(dcmp_us) %>% autoplot() + xlab("US")
+```
+
+## X-11 Decomposition
+
+The X-11 method is designed to work with monthly data, which fits out data set. Even better this method was further developed by Statistics Canada, so hopefully it will work well with our Canadian data. Below we have plotted the X-11 decomposition for the US and Japan. There was no noticeable differences in the X-11 method and the STL method above. Both methods could be used for our data to better understand trend-cycle, remainder and seasonal components. 
+
+
+```{r, fig.show="hold", out.width="50%"}
+x11_US <- maple %>% filter (`Trading Partners` == 'United States') %>% 
+  model(x11 = X_13ARIMA_SEATS(bc_adj ~ x11())) |>
+  components()
+autoplot(x11_US) +
+  labs(title =
+    "Decomposition of total US Imports using X-11.")
+
+x11_JPN <- maple %>% filter (`Trading Partners` == 'Japan') %>% 
+  model(x11 = X_13ARIMA_SEATS(bc_adj ~ x11())) |>
+  components()
+autoplot(x11_JPN) +
+  labs(title =
+    "Decomposition of total Japan Imports using X-11.")
+```
+
+
+## Trend plots
+The trend is part of the STL decomposition and represents the trend-cycle $T_t$. The trend line in the graph is present in red and follows the overall movement of the series, ignoring any seasonal and random fluctuations. In all four graphs a general upward trend can be detected, as we stated previosuly in the decomposition seciton.
+
+```{r, fig.show="hold", out.width="50%", echo=FALSE}
+france_series %>%
+  autoplot(bc_adj, color='gray') +
+  autolayer(components(dcmp_fr), trend, color='red') +
+  xlab("Year") + ylab("bc_adj") +
+  ggtitle("Trend - France")
+
+germany_series %>%
+  autoplot(bc_adj, color='gray') +
+  autolayer(components(dcmp_ge), trend, color='red') +
+  xlab("Year") + ylab("bc_adj") +
+  ggtitle("Trend - Germany")
+```
+
+```{r,fig.show="hold", out.width="50%", echo=FALSE}
+JPN_series %>%
+  autoplot(bc_adj, color='gray') +
+  autolayer(components(dcmp_jp), trend, color='red') +
+  xlab("Year") + ylab("bc_adj") +
+  ggtitle("Trend - Japan")
+
+US_series %>%
+  autoplot(bc_adj, color='gray') +
+  autolayer(components(dcmp_us), trend, color='red') +
+  xlab("Year") + ylab("bc_adj") +
+  ggtitle("Trend - US")
+```
+
+# Forecaster's toolbox
+We created a training set by grouping Japan, the United States, France and Germany, the four countries that we previously chose for analysis. We filtered 85% of the data. Then we tried simple forecasting methods. We decided not to use SNAIVE methods since our data is not seasonal.
+
+```{r, echo=FALSE}
+train <- maple %>%
+  filter(!is.na(bc_adj), `Trading Partners` %in% c("Japan", "France", "United States", "Germany")) %>%
+  filter_index("2002 Jan" ~ "2019 Nov") %>%
+  select(`Trading Partners`, bc_adj)
+
+train <- maple %>%
+  filter(!is.na(bc_adj)) %>%
+  select(bc_adj)
+```
+
+```{r, echo=FALSE}
+fit <- train %>%
+model(
+Naive = NAIVE(bc_adj),
+Drift = RW(bc_adj ~ drift()),
+Snaive = SNAIVE(bc_adj),
+Mean = MEAN(bc_adj)
+)
+```
+
+```{r, echo=FALSE}
+fc <- fit %>%
+fabletools::forecast(h = 24)
+```
+
+```{r, echo=FALSE}
+US_series1<- US_series %>% 
+  select(bc_adj)
+
+JPN_series1 <- JPN_series %>% 
+  select(bc_adj)
+```
+
+## Simple forecasting methods 
+To perform the simple forecasting methods, we created training and test sets for the US and Japan, the countries we believed to be the most interesting to forecast for. When creating the train/test sets, we split the data in an 85%-15% split. 
+
+We did this by filtering the data from January 2002, the starting year of our data, to November 2019, which corresponds to 85%. We used the box-cox adjusted values in this train-test split, since those are the values we will use in our forecasts.
+
+### United States {.unnumbered}
+```{r, echo=FALSE}
+US_train <- US_series1 %>% 
+filter_index("2002 Jan" ~ "2019 Nov") 
+```
+
+```{r, echo=FALSE}
+US_fit_sm <- US_train %>% model(
+  Mean = MEAN(bc_adj),
+  Naive = NAIVE(bc_adj),
+  Drift = (RW(bc_adj ~ drift()))
+  ) 
+```
+
+Our forecast for United States training sets is for a period of 39 months, because it corresponds to 15% of the data, which is the test amount. Below, we plot the forecast for 39 months using simple forecasting methods. You can see a visual comparison of the methods below. 
+
+```{r, echo=FALSE, out.width="75%"}
+US_fc_sm <- US_fit_sm %>% fabletools::forecast(h = 39)
+
+US_fc_sm %>% 
+  fabletools::autoplot(US_series1, level = NULL) +
+    xlab("Date") + ylab("bc_adj") +
+guides(colour = guide_legend(title = "Forecast"))+
+  labs(title = "Comparison of simple forecasting methods - US")
+```
+
+### Japan {.unnumbered}
+Since our data is not seasonal, again, we are excluding the SNAIVE method. We created our training/testing sets for Japan similarly to the US.  Below you can see a visual comparison of the methods.
+
+```{r, echo=FALSE}
+JPN_train <- JPN_series1 %>% 
+  filter_index("2002 Jan" ~ "2019 Nov") 
+```
+
+```{r, echo=FALSE}
+JPN_fit_sm <- JPN_train %>% model(
+  Mean = MEAN(bc_adj),
+  Naive = NAIVE(bc_adj),
+  Drift = (RW(bc_adj ~ drift()))
+  ) 
+```
+
+```{r, echo=FALSE, out.width="75%"}
+JPN_fc_sm <- JPN_fit_sm %>% fabletools::forecast(h = 39)
+
+JPN_fc_sm %>% 
+  fabletools::autoplot(JPN_series1, level = NULL) + 
+    xlab("Date") + ylab("bc_adj") +
+guides(colour = guide_legend(title = "Forecast"))+
+  labs(title = "Comparison of simple forecasting methods - Japan")
+```
+
+## Comparison of Different Simple Methods
+We wanted to compare simple forecasting methods not only visually, but also with different analysis methods. For this, traditional accuracy and cross validation methods were used.
+
+### Traditional Accuracy Measures {.unnumbered}
+Traditional accuracy measures in forecasting methods are used to quantify the difference between the predicted values and the actual values of a time series, and to evaluate the performance of the forecasting model. Again the traditional accuracy measure that we are choosing to focus on is MAPE.
+
+**Traditional Accuracy for the United States Time Series, with all of the simple forecasting methods**
+
+```{r, echo=FALSE}
+US_fc_sm %>% 
+fabletools::accuracy(US_series1) %>% 
+select(.model, .type, ME, RMSE, MAE,MPE, MAPE, MASE,RMSSE, ACF1)
+```
+
+
+**Traditional Accuracy for the Japan time series, with all of the simple forecasting methods**
+
+```{r, echo=FALSE}
+JPN_fc_sm %>% 
+fabletools::accuracy(JPN_series1) %>% 
+select(.model, .type, ME, RMSE, MAE,MPE, MAPE, MASE,RMSSE,ACF1)
+```
+
+### Time Series cross validation {.unnumbered}
+Cross-validation in forecasting methods is a technique for evaluating the performance of a forecasting model by testing it on a subset of data that was not used in training, with the aim of estimating the model's generalization ability, it differs from traditional accuracy measures, which assess the model's performance on the same data used for training. Below you can see the results of cross validation accuracy on our two created models. 
+
+
+**Cross validation accuracy for Japan** 
+
+```{r, echo = FALSE}
+JPN_fit_cv <- JPN_train %>% 
+  stretch_tsibble(.init = 10, .step = 1) %>% 
+  filter(.id != max(.id)) %>% 
+  model(
+    Mean = MEAN(bc_adj),
+    Naive = NAIVE(bc_adj),
+    Drift = RW(bc_adj ~ drift())
+  )
+
+JPN_fc_cv <- JPN_fit_cv %>% fabletools::forecast(h = 39)
+
+JPN_fc_cv %>% fabletools::accuracy(JPN_series) %>% select(.model, .type, RMSE, MAE, MAPE, MASE, RMSSE)
+
+```
+
+
+**Cross validation accuracy for the United States** 
+
+```{r, echo=FALSE}
+US_fit_cv <- US_train %>% 
+  stretch_tsibble(.init = 3, .step = 1) %>% 
+  filter(.id != max(.id)) %>% 
+  model(
+    Mean = MEAN(bc_adj),
+    Naive = NAIVE(bc_adj),
+    Drift = RW(bc_adj ~ drift())
+  )
+
+US_fc_cv <- US_fit_cv %>% fabletools::forecast(h = 39)
+
+US_fc_cv %>% fabletools::accuracy(US_series) %>% select(.model, .type, RMSE, MAE, MAPE, MASE, RMSSE)
+```
+
+## White noise residuals
+Based on the accuracy measures, we decided to continue with the naïve & drift methods. Below, we examined the residuals and ACF plots of the naïve and drift methods of Japan and the United States, to decide whether they look like white noise or not. We found that all of them were white noise since there was no autocorrelation between the majority of their spikes.
+
+### White noise check for Naive method Japan {.unnumbered}
+
+```{r, fig.show="hold", out.width="50%", echo=FALSE, message=FALSE, warning=FALSE}
+JPN_WN_naive <- JPN_train %>% model(NAIVE(bc_adj)) %>% augment()
+autoplot(JPN_WN_naive, .resid) + 
+labs(title = 'Japan - Naive Method', y = "bc_adj", x = 'Date')
+JPN_WN_naive %>% ACF(.resid) %>% autoplot() + labs(y = "ACF", title = "ACF Plot for Japan Naive Residuals")
+```
+
+### White noise check for United States - Naïve method
+
+```{r, fig.show="hold", out.width="50%", echo=FALSE, message=FALSE, warning=FALSE}
+US_WN_naive <- US_train %>% model(NAIVE(bc_adj)) %>%  augment()
+autoplot(US_WN_naive, .resid) +
+labs(title = 'United States - Naive Method', y = "bc_adj", x = 'Date')
+
+US_WN_naive %>% ACF(.innov) %>% autoplot() + labs(y = "ACF", title = "ACF Plot for The United States Naïve Method Residuals")
+```
+
+
+### White noise check for the drift method - Japan
+
+```{r, fig.show="hold", out.width="50%", echo=FALSE,  message=FALSE, warning=FALSE}
+JPN_WN_drift <- JPN_train %>% model(
+Drift = RW(bc_adj ~ drift())
+) %>% augment()
+
+autoplot(JPN_WN_drift, .resid) +
+labs(title = 'Japan - Drift Method', y = "bc_adj", x = 'Date')
+
+JPN_WN_drift %>% ACF(.resid) %>% autoplot() + labs(y = "ACF", title = "ACF Plot for Japan Drift Residuals")
+```
+ 
+### White Noise Check for the Drift Method - United States
+
+```{r, fig.show="hold", out.width="50%", echo=FALSE,  message=FALSE, warning=FALSE}
+US_WN_drift <- US_train %>% model(
+Drift = RW(bc_adj ~ drift())
+) %>% augment()
+
+autoplot(US_WN_drift, .resid) +
+labs(title = 'United States - Drift Method', y = "bc_adj", x = 'Date')
+
+US_WN_drift %>% ACF(.resid) %>% autoplot() + labs(y = "ACF")
+
+```
+
+
+# Exponential Smoothing 
+
+## ETS Model Selection - AAN
+Exponential smoothing methods are used in order to get reliable forecasts for time series. Of course, there are many models we could pick, but it is important to understand our data before making this choice. From analysis of previous sections, it is clear that the model we should use for forecasting is AAN. This model has an additive error term, an additive trend along with no seasonality. Below we will briefly justify this choice of model.
+
+In regard  to the additive error term, there is a lot of variability each year but in general it is an increase which we believe will plateau eventually. Because of this thinking, we believe that it is important to add a damped trend in order to remove the volatility from our forecasts. We added the damped term to be true as it stabilizes the forecast. 
+
+There is an increasing trend throughout the data. Before transformation the trend was quite inconsistent but after performing box-cox transformation the trend started to become clearer and seemed additive. 
+
+It is very clear in previous analysis that there is no seasonality in this data set, which fits with the no seasonality aspect of the model. 
+
+Above gives clear justification that the AAN model is a good choice, and that it coincides with the main features of the data seen through the `summary` function. 
+
+We used this function to examine the residual diagrams and determine if there was in fact an additive trend and error along with no seasonality. In order to demonstrate this, there must be a consistent showing of no patterns. That it is clear in both sets of diagrams for the US and Japan that there is in fact no trend in the residuals thus proving our logic.
+
+## Fitting and Forecasting AAN for Japan
+In this section we will fit an AAN model to Japan, to create forecasts, using the same train-test split as mentioned previously.
+
+The forecast for Japan’s exports over this two-year period suggests a continued upward trend in the short term, with an increase in the level of exports by the end of the forecast horizon. However, the prediction intervals widen considerably, indicating increased uncertainty about the future trajectory of exports. 
+
+```{r, echo=FALSE, out.width ="75%"}
+Japan_ts <- ts(JPN_series$bc_adj, start = c(2002, 1), frequency = 12)
+fit <- ets(Japan_ts)
+fit_Japan <- Japan_ts %>%
+ ets(model = "AAN", damped = TRUE)
+
+forecast_Japan <- forecast(fit_Japan, h = 24)
+autoplot(forecast_Japan)
+```
+
+### Check residuals for Japan {.unnumbered}
+The histogram diagram shows the distribution of the residuals. The histogram is close to symmetric and had a bell shape to it, which is a good sign. If the distributions were heavily skewed or had multiple peaks, it may indicate that the model is not capturing some of the important aspects of the data, but that is not the case here.
+
+The q-q plot compares the distribution of the residuals to a normal distribution. In this case the residual mostly follows the diagonal line which suggests that they are approximately normally distributed. However, there are a few points that deviate from this. This may indicate that the model is not fully capturing some of the higher order moments of the data.
+
+The ACF plot shows the autocorrelation and partial autocorrelation of the residuals. Overall, it does not capture significant autocorrelation or partial autocorrelation which again is a good indication for our model.
+
+The residuals appear to be random and scattered around zero, with no discernible pattern. This suggests that the residuals represent white noise and that the model is a good fit for the data.
+
+
+```{r}
+checkresiduals(fit_Japan)
+```
+
+The Ljung-Box test is a statistical test used to assess the presence of autocorrelation in the residuals of a time series model. It helps determine if there are any remaining patterns or significant correlations in the residuals that the model has not captured. In the results, the test statistic ‘Q*’ is 18.556, with degrees of freedom (df) equal to 19, and a p-value of 0.4857. The p-value indicates the probability of observing the test statistic if there is no autocorrelation. In this case, since the p-value is relatively high (greater than 0.05), it suggests that there is no significant evidence of autocorrelation in the residuals.
+
+### Summary of Japan Fit {.unnumbered}
+Below shows the summary of the fitted AAN model to the Japan training set. This will be used to compare the AAN model to other models. 
+
+```{r}
+train_fit_Japan <- JPN_train$bc_adj %>%
+ ets(model = "AAN", damped = TRUE)
+
+summary(train_fit_Japan)
+
+```
+
+
+## Fitting and Forecasting AAN for United States
+The forecast for the US exports over a two year period suggests a gradual increase in the short term, followed by a decline towards the end of the forecast horizon. The prediction intervals are quite wide, suggesting increased uncertainty.
+
+```{r, out.width ="75%"}
+United_States_ts <- ts(US_series$bc_adj, start = c(2002, 1), frequency = 12)
+  fit <- ets(United_States_ts)
+
+fit_United_States <- United_States_ts %>%
+  ets(model = "AAN", damped = TRUE)
+
+forecast_United_States <- forecast(fit_United_States, h = 24)
+autoplot(forecast_United_States)
+```
+
+
+### Check residuals for United States {.unnumbered}
+These results are something very similar to Japan, again, the histogram shows signs of a bell curve which is a good sign. The residuals appear to be randomly scattered around zero, with no clear pattern. This suggests that the residuals represent white noise and that the model is a good fit for the data.
+
+```{r}
+checkresiduals(fit_United_States)
+```
+
+The Ljung-Box test shows a p-value of 0.2115, which is greater than the common significance level of 0.05. This suggests that there is no significant evidence of autocorrelation in the residuals, indicating that the model has likely captured the patterns and dependencies in the data well. 
+
+### Summary of US Training Data {.unnumbered}
+
+Below shows the summary of the fitted AAN model to the US training set.
+```{r}
+train_fit_US <- US_train$bc_adj %>%
+ ets(model = "AAN", damped = TRUE)
+
+summary(train_fit_US)
+```
+
+
+# Making an ARIMA model
+
+## Check for stationarity
+Because we have established that our data lacks seasonality we will build a standard ARIMA model. Checking for stationarity in our data allows us to determine our order of first differencing of our d term. If our data is already stationary then we would have a d-term of 0. The action of making a time series stationary is differencing. We can use a unit root test such as the KPSS test to test our series. Unit root tests are statistical hypothesis tests of stationarity. For the KPSS test the null hypothesis assumes our data is stationary, and we will look for evidence to reject this hypothesis. With that, if we observe a small p-value (<0.05) it suggests that differencing is required.
+
+First we will plot Japan. We will use the `unitroot_kpss` function to formally tell us if differencing is required. If the `kpss_pvalue` is lower than 0.05 it suggests that differencing is required. Alternatively we can even use the `unitroot_ndiffs` function to tell us how many orders of differencing is required to make our data stationary.
+
+```{r, warning=FALSE, out.width="75%"}
+JPN_series %>% autoplot(bc_adj) + labs(title = "Japan exports")
+JPN_series %>% features(bc_adj,unitroot_kpss)
+JPN_series %>% features(bc_adj, unitroot_ndiffs)
+```
+
+Japan before first difference 
+```{r, warning=FALSE}
+US_series_unitroot_ndiffs <- US_series %>% features(bc_adj, unitroot_ndiffs)
+```
+
+```{r, out.width="75%", warning=FALSE}
+#We will do 1 order of differencing on JPN
+JPN_series %>% autoplot(difference(bc_adj)) + labs(title = "Japan - difference in the Box-Cox transformed values")
+```
+Japan after first difference 
+
+## ACF and PACF plots {.unnumbered}
+We will then plot the ACF and PACF to build manual models. Note that we cannot combine p and q terms using this method. Results from this suggest an ARIMA(0, 1, 3) or ARIMA(1, 1, 0). For conciseness, here we have only included Japan in our plots, as they demonstrate similar things. 
+
+```{r, warning=FALSE,  out.width="75%"}
+#Plot the ACF and PACF
+JPN_series %>% gg_tsdisplay(difference(bc_adj), plot_type = "partial")
+US_ACF_PACF<- US_series %>% gg_tsdisplay(difference(bc_adj), plot_type = "partial")
+```
+
+From the results of both tests we can conclude that in fact our data is not stationary and we need to difference once, so our d term for our ARIMA model will be 1. We will then plot the ACF and PACF to build manual models. Note that we cannot combine p and q terms using this method. Results from this suggest an ARIMA(0, 1, 3) or ARIMA(1, 1, 0)
+
+## Building an ARIMA model
+
+We can generate different ARIMA models using R's automatic stepwise suggested model, our manual models from above and a search function. We will determine which model to use based on the lowest AICc value fit to our training data. The AIC selection criteria is optimized for choosing our p and q terms. Our d term is decided already as explained above. Below we built different ARIMA models on the training sets so we can validate model accuracy
+
+```{r, out.width="75%"}
+US_train <- US_series %>%
+filter_index("2002 Jan" ~ "2019 Nov") %>%
+select(bc_adj)
+
+
+JPN_train <- JPN_series %>%
+filter_index("2002 Jan" ~ "2019 Nov") %>%
+select(bc_adj)
+
+
+JPN_fit_arima <- JPN_train %>% 
+  model(
+    arima013 = ARIMA(bc_adj ~ pdq(0,1,3)),
+    arima110 = ARIMA(bc_adj ~ pdq(1,1,0)),
+    stepwise = ARIMA(bc_adj),
+    search = ARIMA(bc_adj, stepwise=FALSE))
+
+glance(JPN_fit_arima) %>%  arrange(AICc) %>%  select(.model:BIC)
+
+JPN_fit_arima %>% select(stepwise) %>% gg_tsresiduals()
+
+augment(JPN_fit_arima) |>
+  filter(.model=='stepwise') |>
+  features(.innov, ljung_box, lag = 10, dof = 3)
+```
+
+The `gg_tsresiduals()` function allows us to graph the selected model and check its residuals as a visual diagnostic. For our selected models the residuals appear to be normally distributed around 0 and also resemble white noise which is positive. So we will move forward with the stepwise model which is an ARIMA(0,1,2). A portmanteau test returns a high p-value (>0.05) which also suggests the residuals are white noise. We repeated this for the USA and found the best model to also be the stepwise model.
+
+## Auto Arima 
+We can also use an auto_arima function that will iterate through many combinations to help us decide on which ARIMA model to use. The auto_arima function suggests a ARIMA(3,1,2) for US and ARIMA(0,1,2) for JPN. With this function we could also pass though many parameters such as selecting the max d term and setting seasonal to FALSE.
+```{r}
+US_auto_arima <- auto.arima(US_train$bc_adj, max.d = 1, seasonal = FALSE, stepwise = FALSE)
+JPN_auto_arima <- auto.arima(JPN_train$bc_adj, max.d = 1, seasonal = FALSE, stepwise = FALSE)
+
+```
+
+## Accuracy tests
+Below we have forecast our ARIMA models the same length of the test set to compare our predicted values versus the actual values to calculate a MAPE. 
+
+```{r, out.width="75%"}
+#Accuracy tests 
+JPN_fc <- JPN_fit_arima %>% fabletools::forecast(h=39)
+JPN_fc %>% autoplot(bind_rows(JPN_series1)) + labs(title = "Japan - Accuracy tests ")
+fabletools::accuracy(JPN_fc, JPN_series1)  
+
+#US_fc <- fit_US_arima %>% fabletools::forecast(h=39)
+#US_fc %>% autoplot(bind_rows(US_series1))
+#fabletools::accuracy(US_fc, US_series1)
+
+```
+
+
+## Arima Forecast
+Now we will forecast for the next two years with our ARIMA models
+
+```{r, out.width="75%"}
+Auto_US_ARIMA_model <- arima(US_series$bc_adj, order = c(3,1,2))
+
+US_ARIMA_fc<- forecast(Auto_US_ARIMA_model, h= 24)
+
+plot(US_series$bc_adj, type = 'l', xlab = 'Time', ylab = 'bc_adj', main = 'US ARIMA Forecast')
+lines(US_ARIMA_fc$mean, col = 'red')
+
+legend('topleft', legend = c('Original Series', 'Forecast'), col = c('black', 'red'), lty = c('solid', 'solid'), bty = 'n')
+
+```
+```{r, out.width="75%"}
+Auto_JPN_ARIMA_model <- arima(JPN_series$bc_adj, order = c(0,1,2))
+
+JPN_ARIMA_fc <- forecast(Auto_JPN_ARIMA_model, h= 24)
+
+plot(JPN_series$bc_adj, type = 'l', xlab = 'Time', ylab = 'bc_adj', main = 'JPN ARIMA Forecast')
+lines(JPN_ARIMA_fc$mean, col = 'red')
+
+legend('topleft', legend = c('Original Series', 'Forecast'), col = c('black', 'red'), lty = c('solid', 'solid'), bty = 'n')
+```
+
+# Other Forecasting Methods
+While previously throughout our report we have created forecasts using the data from linear interpolation, we were curious what the forecast would look like if we instead used the data from the original, intermittent demand series, including the zeroes. We then researched forecasting methods that were designed to work with intermittent demand data, and came across Croston's SBA method (Syntetos-Boylan Approximation). We chose to use this method as another form of forecasting to further understand what the forecast would look like if we used our original data. 
+
+## Croston's method - SBA
+Croston's SBA (Syntetos-Boylan Approximation) is a modification of Croston's method, and focuses on separately forecasting the non-zero demand occurrences and the intervals between them.  Croston's SBA method is suitable for data with trends (where the original Croston's method is not). Given that our data has trends, we chose to use this variant of Croston's method. It uses an ARIMA method for the trend component of the data, and a Croston component for the intermittent demand pattern.
+
+The method does not take the scale of the data into account, so we needed the transformed data with zeroes remaining, meaning that we used our `log1p` transformed data from section two. 
+
+To create our forecasts using Croston's SBA we used the tsintermittent package, which is designed for intermittent demand data. We also created our own function to calculate forecasting errors in order to see the effectiveness of our model. 
+
+Below you can see our forecasts for both the United States and Japan, alongside their traditional accuracy measures, which we created a custom function for. 
+
+```{r echo = FALSE, out.width="75%"}
+#Function to calculate forecast errors
+calc_fc_errors <- function(tsibble) {
+  #calculate mae
+  mae <- mean(abs(tsibble$log1p_adj[2:length(tsibble)] - tsibble$forecast_c[2:length(tsibble)]), na.rm = TRUE)
+  
+  #calculate mse
+  mse <- mean((tsibble$log1p_adj - tsibble$forecast_c)^2, na.rm = TRUE)
+  
+  #Calculate RMSE
+  rmse <- sqrt(mse)
+  
+  #calculate MAPE
+  mape <- mean(abs(ifelse(tsibble$log1p_adj == 0, NA,(tsibble$log1p_adj - tsibble$forecast_c)/tsibble$log1p_adj)), na.rm = TRUE) * 100
+  
+  return(list(
+    "MAE" = mae, 
+    "MSE" = mse, 
+    "RMSE" = rmse,
+    "MAPE" = mape))
+}
+```
+
+### For the United States {.unnumbered}
+As the MAPE value is below 10%, we can consider this to be a relatively good model for the US, although because we used a different transformation for the base data for this forecast it is difficult to compare with the other forecasts in the report.
+
+```{r echo = FALSE, out.width="75%"}
+#Make tsibble wiht just US
+US_series <- maple %>% 
+  filter(`Trading Partners`=="United States") 
+
+#Forecast
+us_fc_c <- crost(US_series$log1p_adj, h=15, type = "sba", outplot = TRUE)
+
+#Add the forecast values to the tsibble
+US_series <- US_series %>% 
+  mutate(forecast_c = us_fc_c$frc.in)
+
+```
+```{r echo = FALSE}
+calc_fc_errors(US_series)
+```
+
+### For Japan {.unnumbered}
+As the MAPE value is below 10%, we can consider this to be a relatively good model for Japan, but again,  although because we used a different transformation (`log1p`) for the base data it is difficult to compare with the other forecasts in the report, and beyond our scope at this time. 
+
+```{r echo = FALSE, out.width="75%"}
+#Make new tsibble for japan
+JPN_series <- maple %>% 
+  filter(`Trading Partners`=="Japan")
+
+#forecast
+jap_fc_c <- crost(JPN_series$log1p_adj, h=15, type = "sba", outplot = TRUE)
+
+#add to tsibble
+JPN_series <- JPN_series %>% 
+  mutate(forecast_c = jap_fc_c$frc.in)
+```
+
+```{r echo = FALSE}
+calc_fc_errors(JPN_series)
+```
+
+# Discussion 
+For this project, we built different models to forecast our time series. These included Naïve, Drift, AAN and ARIMA. We used mean absolute percentage errors (MAPE) as a predictor of model accuracy. The training data we used in our models was the first 85% of the time series data up to Nov 2019. We fit the model to the test data and forecast the remaining 15% (39 periods) to compare forecasted vs actual values.
+
+Simple forecasting methods including Naïve, Drift and Mean were applied to both Japan and United States. We observed that the best model was the Naïve model for both series. The Naïve Model has the lowest MAPE value of 4.5%, indicating that it provides the best overall percentage accuracy in predicting the time series. The Drift Model follows closely behind with a slightly higher MAPE (5.8%). The Mean Model performs the worst, with the highest MAPE (10.45%). Therefore, the Naïve Model appears to be the best choice among the simple forecasting methods, as it has the lowest values for both metrics. Japan’s Drift, Mean and Naïve MAPE scores were 13.7%, 36.3% and 11% respectively. 
+
+Following this we explored exponential smoothing methods. The model we choose was the AAN model for both Japan and the United States. United States has a 5.9% MAPE which is competitive with the other models. Japan returned a MAPE of 21.9% which was a poor result compared to the ARIMA model and the models used in the simple forecasting methods section such as drift. 
+
+Japan’s ARIMA (0,1,2) returned a MAPE of 10.2%, while the United States (3,1,2) returned a MAPE of 5.2%.
+
+Taken together, results from simple forecasting methods, exponential smoothing methods and ARIMA modelling suggests that for the United States, the Naïve model should be considered for making forecasts. In regard to Japan we found that an ARIMA(0,1,2) returned the lowest error and this is the model that should be considered for future forecasts.
+
+There are of course limitations to every model and there are some reasons why the AAN model may have performed worse. For one, AAN models can be sensitive to outliers in the dataset resulting in larger forecasting errors. Our dataset has many outliers. When we compare this to ARIMA and simple forecasting methods, they tend to be more robust, which could explain the differences especially in the Japan forecast. Moreover, AAN models often need a larger amount of data to train effectively but this limitation may not be exclusive to just the AAN model and may explain the higher error terms in all models.
+
+We also applied Croston’s SBA method as an alternative to the more traditional methods. Our independent variable here was `log1p` transformed series. For this reason, it is difficult to compare model accuracy to the other models we used in this project. Nevertheless we generated accuracy measures for this model and it returned a MAPE of 7.3% for Japan and 8.2% for the United States.  
+
+# Conclusion and lessons learned
+
+In conclusion, this project served as a valuable introduction to forecasting for our team. One important lesson we learned is the significance of carefully selecting a suitable data set that meets assignment requirements, as working with intermittent data made completing this assignment challenging. However, this challenge helped us learn more about forecasting then we would have otherwise.
+
+
+# References:
+Croston, J. D. (1972). Forecasting and stock control for intermittent demand. Operational Research Quarterly, 23(3), 289-303.
+
+Cuemath. (n.d.). Linear Interpolation Formula - Definition, Formula, and Solved Examples. Retrieved May 5, 2023, from https://www.cuemath.com/linear-interpolation-formula/
+
+Gabor, A., & Ceballos, F. (2020). tsintermittent: Intermittent Time Series Forecasting. R package version 1.5.1. Retrieved from https://cran.r-project.org/web/packages/tsintermittent/tsintermittent.pdf
+
+Government of Canada. (2021). Statistical Overview of the Canadian Maple Industry 2021. Agriculture and Agri-Food Canada. Retrieved from https://agriculture.canada.ca/en/sector/horticulture/reports/statistical-overview-canadian-maple-industry-2021
+
+Hyndman, R. J., Athanasopoulos, G., & Bergmeir, C. (2021). Time series of counts. In Forecasting: Principles and Practice (3rd ed.). OTexts. Retrieved from https://otexts.com/fpp3/counts.html
+
+Hyndman, R. J., Athanasopoulos, G., & Bergmeir, C. (2021). Forecasting: Principles and Practice (3rd ed.). OTexts. Retrieved from https://otexts.com/fpp3/
+
+Kabir, G., Wang, Y., & Ye, J. (2018). Predictive analytics for renewable energy production: A review. Renewable and Sustainable Energy Reviews, 94, 164-177. https://doi.org/10.1016/j.rser.2018.05.010
+
+Petropoulos, F., & Kourentzes, N. (2021). Forecasting with intermittent demand: A selective review. International Journal of Forecasting, 37(1), 131-151. doi: 10.1016/j.ijforecast.2020.05.002
+
+Statistics Canada. Table 12-10-0136-01  Canadian international merchandise trade by industry for all countries
+
+Federal Reserve Bank of St. Louis. (n.d.). Canada Consumer Price Index for All Items, All Consumers, Goods and Services: All Items (CPALCY01CAM661N). FRED Economic Data. Retrieved April 20, 2023, from https://fred.stlouisfed.org/series/CPALCY01CAM661N
